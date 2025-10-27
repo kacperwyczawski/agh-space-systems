@@ -137,3 +137,13 @@ altitude_frame = Frame(
     ids.DataTypeID.FLOAT,
     ids.OperationID.SENSOR.value.READ,
 )
+angle_frame = Frame(
+    ids.BoardID.SOFTWARE,
+    ids.PriorityID.LOW,
+    ids.ActionID.FEED,
+    ids.BoardID.ROCKET,
+    ids.DeviceID.SENSOR,
+    4,
+    ids.DataTypeID.FLOAT,
+    ids.OperationID.SENSOR.value.READ,
+)
