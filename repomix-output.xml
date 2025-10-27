@@ -1,0 +1,2530 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+communication_library/
+  communication_manager.py
+  exceptions.py
+  frame.py
+  ids.py
+  protocol.py
+  singleton.py
+  tcp_transport.py
+  transport.py
+.gitignore
+.python-version
+frame_sending_receiving_example.py
+frames.py
+main.py
+pyproject.toml
+README.md
+simulator_config.yaml
+tcp_proxy.py
+tcp_simulator.py
+ui.py
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="communication_library/communication_manager.py">
+from typing import Callable, List, Optional
+from collections import deque
+import os
+
+from communication_library.exceptions import (MissingHeaderError,
+                                                                 UnregisteredCallbackError)
+
+from communication_library.exceptions import TransportError  # pylint: disable=ungrouped-imports
+from communication_library.tcp_transport import TcpTransport # pylint: disable=ungrouped-imports
+from communication_library.frame import Frame # pylint: disable=ungrouped-imports
+from communication_library.protocol import GroundStationProtocol # pylint: disable=ungrouped-imports
+
+from communication_library.ids import HEADER_ID, BoardID
+from communication_library.ids import PriorityID
+from communication_library.transport import (TransportSettings,
+                                                                TransportOptions,
+                                                                TransportInfo,
+                                                                TransportType)
+
+
+class CommunicationManager:
+    """
+    Main communication interface for the Ground Station.
+    """
+
+    def __init__(self) -> None:
+        self._transport = None
+        self._protocol = GroundStationProtocol()
+        self._priority_buffer = {int(priority): deque() for priority in PriorityID}
+        self._callbacks = {}
+
+    @property
+    def transport_info(self) -> TransportInfo:
+        """
+        Returns info about connection: serial port, baudrate, read and write timeout.
+        """
+        return self._transport.info
+
+    def change_transport_type(self, transport_type: TransportType):
+        if self.is_connected:
+            self._transport.close()
+
+        if transport_type == TransportType.TCP:
+            self._transport = TcpTransport()
+
+
+        else:
+            raise TransportError(f'Attempted to use non existent transport: {transport_type}')
+
+    @property
+    def transport_options(self) -> TransportOptions:
+        return self._transport.options()
+
+    @property
+    def is_connected(self) -> bool:
+        """
+        Property returning current connection state.
+        """
+        if self._transport is None:
+            return False
+
+        return self._transport.is_open
+
+    def connect(self, transport_options: TransportSettings, timeout: int = 0,
+                write_timeout: Optional[int] = 1) -> None:
+        """
+        Opens the communication transport.
+        :param transport_options: used to establish underlying transport connection
+        :param timeout: read timeout in seconds, None for forever, 0 for non-blocking
+        :param write_timeout: write timeout in seconds, same as read timeout
+        """
+        for queue in self._priority_buffer.values():
+            queue.clear()
+        self._transport.open(transport_options, timeout, write_timeout)
+
+    def disconnect(self) -> None:
+        """
+        Closes the communication transport.
+        """
+        self._transport.close()
+
+    def register_callback(self, callback: Callable, frame: Frame) -> None:
+        """
+        Registers a Callable as a hook called upon receiving a response.
+        :param callback: response hook
+        :param frame: frame used as a key for response callback
+        """
+        if frame.destination == BoardID.BROADCAST:
+            callback_keys = self.create_broadcast_callback_keys(frame)
+            for key in callback_keys:
+                assert key not in self._callbacks
+                self._callbacks[key] = callback
+        else:
+            #frame = frame.as_reversed_frame()
+            assert frame not in self._callbacks
+            self._callbacks[frame] = callback
+
+    def unregister_callback(self, frame: Frame):
+        frame = frame.as_reversed_frame()
+        self._callbacks.pop(frame, None)
+
+    def clear_callbacks(self):
+        self._callbacks.clear()
+
+    def push(self, frame: Frame) -> None:
+        """
+        Put the frame in a buffer for sending
+        :param frame: frame to add to the queue
+        """
+        self._priority_buffer[frame.priority].append(frame)
+
+    def pop(self, default=None) -> Frame:
+        """
+        Pop out first of the buffered frames according to their priority.
+        """
+        for queue in self._priority_buffer.values():
+            if queue:
+                return queue.popleft()
+        return default
+
+    def send(self) -> Frame:
+        """
+        Sends first of the queued frames to the hardware.
+        """
+        frame = self.pop()
+        if frame is not None:
+            frame_bytes = self._protocol.encode(frame)
+            self._transport.write(frame_bytes)
+        return frame
+
+    def receive(self) -> Frame:
+        """
+        Receives some data from the transport, governed by the protocol.
+        """
+        header = self._transport.read(1)
+        if header != bytes([HEADER_ID]):
+            raise MissingHeaderError(f'Received byte is not a header: {header}')
+
+        raw_frame = self._transport.read(13)
+        frame = self._protocol.decode(header + raw_frame)
+        frame_matched = False
+        try:
+            self._callbacks[frame](frame)
+            frame_matched = True
+        except KeyError:
+            pass
+
+        if not frame_matched:
+            raise UnregisteredCallbackError(frame)
+
+        return frame
+
+    def clear_pattern_pre_processors(self):
+        self._pattern_pre_processors = []
+
+    def clear_pattern_post_processors(self):
+        self._pattern_post_processors = []
+
+    def create_broadcast_callback_keys(self, frame) -> List[Frame]:
+        frame_kwargs = frame.as_reversed_frame().as_dict()
+        callback_keys = []
+        assert frame_kwargs['source'] == BoardID.BROADCAST
+        for source in BoardID:
+            if source == BoardID.LAST_BOARD:
+                break
+            if source not in (BoardID.BROADCAST, BoardID.GRAZYNA):
+                frame_kwargs['source'] = source
+                callback_keys.append(Frame(**frame_kwargs))
+        return callback_keys
+
+    @property
+    def read_buffer_size(self) -> int:
+        return self._transport.read_buffer_size
+</file>
+
+<file path="communication_library/exceptions.py">
+class CommunicationError(Exception):
+    """Base class for communication exceptions"""
+
+
+class TransportError(CommunicationError):
+    """Base class for all errors related to transport"""
+
+
+class ProtocolError(CommunicationError):
+    """Base class for all errors realted to protocol"""
+
+
+class ClosedTransportError(TransportError):
+    """Called when trying to write or read from a closed transport"""
+
+
+class TransportTimeoutError(TransportError):
+    """Called when reading from transport takes too much time"""
+
+
+class TransportNotFoundError(TransportError):
+    """Called when a transport of given specification does not exist"""
+
+
+class ChecksumMismatchError(CommunicationError):
+    """Raised when calculated checksum doesn't match the received frame"""
+
+
+class MissingHeaderError(CommunicationError):
+    """Raised when the first received byte is not the frame header"""
+
+
+class UnregisteredCallbackError(CommunicationError):
+    """Raised when a callback for the received frame doesn't exist"""
+
+    def __init__(self, frame, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.frame = frame
+
+    def __str__(self):
+        return f'Unregistered callback for frame: {self.frame}'
+</file>
+
+<file path="communication_library/frame.py">
+from numbers import Number
+from typing import Tuple, Union, Any
+from dataclasses import dataclass, field, fields, asdict, InitVar
+
+from communication_library import ids
+
+
+@dataclass(frozen=True, order=True)
+class Frame:
+    """
+    Represents a frame used to exchange information with the rocket.
+    :param destination:  device that the frames is sent to
+    :param priority:     level of how important the information is
+    :param action:       type of action that the frame represents (e.g.
+                         service or request)
+    :param source:       device that the frame is sent from
+    :param device_type:  type of the hardware that the action is connected
+                         to (e.g. servo or relay)
+    :param device_id:    id number of the device, unique within device type
+    :param data_type:    type of data that is being sent (e.g. int32 or float)
+    :param operation:    id of the operation performed on the device
+    :param payload:      actual information sent with the frame
+    """
+    destination: int = field(metadata={'bits': 5})
+    priority: int = field(metadata={'bits': 2}, hash=False, compare=False)
+    action: int = field(metadata={'bits': 4})
+    source: int = field(metadata={'bits': 5})
+    device_type: int = field(metadata={'bits': 6})
+    device_id: int = field(metadata={'bits': 6})
+    data_type: int = field(metadata={'bits': 4}, hash=False, compare=False)
+    operation: int = field(metadata={'bits': 8})
+    payload: Tuple[Number] = field(metadata={'bits': 32}, hash=False, compare=False,
+                                   default_factory=tuple) 
+
+    def __post_init__(self):
+        for field_name, value in self.as_dict().items():
+            if field_name == 'payload':
+                self._ensure_payload_type(value)
+            else:
+                self._ensure_value_type(field_name, value)
+
+    def as_dict(self) -> dict:
+        return asdict(self)
+
+    def _ensure_payload_type(self, payload: tuple) -> None:
+        error_msg = f'{self} has payload of type {type(payload)}'
+        assert isinstance(payload, tuple), error_msg
+        zero_padding = (0 for _ in range(self._valid_payload_len - len(payload)))
+        object.__setattr__(self, 'payload', (*self.payload, *zero_padding))
+        error_msg = f'{self} has wrong payload length (expected {self._valid_payload_len})'
+        assert self._valid_payload_len == len(self.payload), error_msg
+
+    @property
+    def _valid_payload_len(self) -> int:
+        return {int(ids.DataTypeID.NO_DATA): 0,
+                int(ids.DataTypeID.UINT32): 1,
+                int(ids.DataTypeID.UINT16): 1,
+                int(ids.DataTypeID.UINT8): 1,
+                int(ids.DataTypeID.INT32): 1,
+                int(ids.DataTypeID.INT16): 1,
+                int(ids.DataTypeID.INT8): 1,
+                int(ids.DataTypeID.FLOAT): 1,
+                int(ids.DataTypeID.INT16X2): 2,
+                int(ids.DataTypeID.UINT16INT16): 2}[self.data_type]
+
+    def _ensure_value_type(self, field_name: str, value: int) -> None:
+        try:
+            object.__setattr__(self, field_name, int(value))
+        except (ValueError, TypeError) as err:
+            error_msg = f'{self!r} failed to convert {field_name} of type {type(value)}: '
+            raise AssertionError(error_msg + str(err))
+
+    @property
+    def data(self) -> Union[Number, Tuple[Number, ...]]:
+        return self.payload[0] if self._valid_payload_len == 1 else self.payload
+
+    @classmethod
+    def values_format_str(cls) -> str:
+        return ''.join('u' + str(f.metadata['bits']) for f in fields(cls) if f.name != 'payload')
+
+    @classmethod
+    def payload_format_str(cls, data_type: int) -> str:
+        # padding 'p' added to always match 32 bits total
+        return {int(ids.DataTypeID.NO_DATA): 'p32',
+                int(ids.DataTypeID.UINT32): 'u32',
+                int(ids.DataTypeID.UINT16): 'u16p16',
+                int(ids.DataTypeID.UINT8): 'u8p24',
+                int(ids.DataTypeID.INT32): 's32',
+                int(ids.DataTypeID.INT16): 's16p16',
+                int(ids.DataTypeID.INT8): 's8p24',
+                int(ids.DataTypeID.FLOAT): 'f32',
+                int(ids.DataTypeID.INT16X2): 's16s16',
+                int(ids.DataTypeID.UINT16INT16): 'u16s16'}[data_type]
+
+    def as_reversed_frame(self) -> 'Frame':
+        return Frame(destination=self.source,
+                     priority=self.priority,
+                     action=self.action,
+                     source=self.destination,
+                     device_type=self.device_type,
+                     device_id=self.device_id,
+                     data_type=self.data_type,
+                     operation=self.operation,
+                     payload=self.payload)
+
+    def as_mono_str(self) -> str:
+        device_name = ids.DeviceID(self.device_type).name
+        return ' '.join((f'{ids.BoardID(self.destination).name:<9}',
+                         f'{ids.PriorityID(self.priority).name:<4}',
+                         f'{ids.ActionID(self.action).name:<8}',
+                         f'{ids.BoardID(self.source).name:<7}',
+                         f'{device_name:<9}',
+                         f'{self.device_id:<2}',
+                         f'{self.payload_format_str(self.data_type):<7}',
+                         f'{ids.OperationID[device_name].value(self.operation).name:<15}',
+                         f'{self.payload}')).lower()
+
+    def __str__(self):
+        device_name = ids.DeviceID(self.device_type).name
+        return ', '.join((f'Frame({ids.BoardID(self.destination).name}',
+                          f'{ids.PriorityID(self.priority).name}',
+                          f'{ids.ActionID(self.action).name}',
+                          f'{ids.BoardID(self.source).name}',
+                          f'{device_name}',
+                          f'{self.device_id}',
+                          f'{ids.DataTypeID(self.data_type).name}',
+                          f'{ids.OperationID[device_name].value(self.operation).name}',
+                          f'{self.payload})')).lower()
+</file>
+
+<file path="communication_library/ids.py">
+from enum import Enum, IntEnum, unique
+
+HEADER_ID = 0x05
+
+
+@unique
+class BoardID(IntEnum):
+    SOFTWARE = 0x01
+    ROCKET = 0x02
+    LAST_BOARD = 0x09
+    PROXY = 0x1E
+    BROADCAST = 0x1F
+
+
+class DeviceID(IntEnum):
+    SERVO = 0x00
+    RELAY = 0x01
+    SENSOR = 0x02
+
+
+@unique
+class ActionID(IntEnum):
+    FEED = 0x00
+    SERVICE = 0x01
+    ACK = 0x02
+    NACK = 0x03
+
+
+@unique
+class DataTypeID(IntEnum):
+    NO_DATA = 0x00
+    UINT32 = 0x01
+    UINT16 = 0x02
+    UINT8 = 0x03
+    INT32 = 0x04
+    INT16 = 0x05
+    INT8 = 0x06
+    FLOAT = 0x07
+    INT16X2 = 0x08
+    UINT16INT16 = 0x09
+
+
+@unique
+class PriorityID(IntEnum):
+    HIGH = 0x00
+    LOW = 0x01
+
+
+@unique
+class _ServoOperationID(IntEnum):
+    OPEN = 0x01 # unused, for setting position use POSITION
+    CLOSE = 0x02 # unused, for setting position use POSITION
+    OPENED_POS = 0x03
+    CLOSED_POS = 0x04
+    POSITION = 0x05
+    DISABLE = 0x06
+    RANGE = 0x07
+
+@unique
+class _RelayOperationID(IntEnum):
+    OPEN = 0x01
+    CLOSE = 0x02
+    STATUS = 0x03
+
+class _SensorOperationID(IntEnum):
+    READ = 0x01
+
+class OperationID(Enum):
+    SERVO = _ServoOperationID
+    RELAY = _RelayOperationID 
+    SENSOR = _SensorOperationID
+
+
+class AckStatus(IntEnum):
+    DISABLED = 0
+    WAITING = 1
+    READY = 2
+    SUCCESSFUL = 3
+    FAILED = 4
+
+
+class LogLevel(IntEnum):
+    NOTSET = 0
+    DEBUG = 10
+    INFO = 20
+    WARNING = 30
+    ERROR = 40
+    CRITICAL = 50
+</file>
+
+<file path="communication_library/protocol.py">
+import struct
+
+import bitstruct
+from crccheck.crc import Crc32Mpeg2
+
+from communication_library.exceptions import (
+    ChecksumMismatchError, ProtocolError)
+from communication_library.frame import Frame
+from communication_library.ids import HEADER_ID
+
+
+class GroundStationProtocol:
+    """
+    AGH Space Systems main ground station protocol for rocket communication.
+    """
+    HEADER_BYTE_LENGTH = 1
+    PAYLOAD_BYTE_LENGTH = 4
+    CRC_BYTE_LENGTH = 4
+
+    @classmethod
+    def encode(cls, frame: Frame) -> bytes:
+        try:
+            data = cls._pack(frame)
+        except bitstruct.Error as err:
+            raise ProtocolError(f'Encoding {frame} to bytes failed:' + str(err))
+
+        data = bytes(cls._reverse_bits(byte) for byte in data)
+        crc = cls.calculate_crc(data)
+        return data + crc
+
+    @classmethod
+    def _pack(cls, frame: Frame) -> bytes:
+        values = tuple(v for k, v in frame.as_dict().items() if k != 'payload')
+
+        header = bitstruct.pack(f'<u{cls.HEADER_BYTE_LENGTH*8}', HEADER_ID)
+        values = bitstruct.pack('<' + Frame.values_format_str(), *values)
+        payload = bitstruct.pack('<' + Frame.payload_format_str(frame.data_type), *frame.payload)
+        return header + values + payload
+
+    @classmethod
+    def decode(cls, data: bytes) -> Frame:
+        data, crc = data[:-cls.CRC_BYTE_LENGTH], data[-cls.CRC_BYTE_LENGTH:]
+        if crc != cls.calculate_crc(data):
+            raise ChecksumMismatchError
+
+        data = bytes(cls._reverse_bits(byte) for byte in data)
+        try:
+            return cls._unpack(data)
+        except bitstruct.Error as err:
+            raise ProtocolError(f'Decoding {data} to frame failed:' + str(err))
+
+    @classmethod
+    def _unpack(cls, data: bytes) -> Frame:
+        data, payload = data[:-cls.PAYLOAD_BYTE_LENGTH], data[-cls.PAYLOAD_BYTE_LENGTH:]
+        _, values = data[:cls.HEADER_BYTE_LENGTH], data[cls.HEADER_BYTE_LENGTH:]
+
+        values = bitstruct.unpack('<' + Frame.values_format_str(), values)
+        data_type = Frame(*values).data_type
+        payload = bitstruct.unpack('<' + Frame.payload_format_str(data_type), payload)
+        return Frame(*values, payload=payload)
+
+    @classmethod
+    def calculate_crc(cls, data: bytes,
+                      skip_padding: bool = False,
+                      return_endianess: str = 'little') -> bytes:
+        # padding to a multiple of 4 bytes, because we're using 32bit crc
+        if not skip_padding:
+            data += (4 - (len(data) % 4)) * b'\x00'
+        format_str = int(len(data)/4)*'I'
+        big_endian_data = struct.pack('>' + format_str, *struct.unpack(format_str, data))
+        return Crc32Mpeg2.calc(big_endian_data).to_bytes(cls.CRC_BYTE_LENGTH, return_endianess)
+
+    @classmethod
+    def _reverse_bits(cls, byte: int) -> int:
+        # Reversing bit order using int's binary padded string representation
+        return int(f'{byte:08b}'[::-1], 2)
+</file>
+
+<file path="communication_library/singleton.py">
+from abc import ABCMeta
+
+class Singleton(ABCMeta):
+    _instances = {}
+
+    def __call__(cls, *args, **kwargs):
+        if cls not in cls._instances:
+            cls._instances[cls] = super(Singleton, cls).__call__(*args, **kwargs)
+        return cls._instances[cls]
+</file>
+
+<file path="communication_library/tcp_transport.py">
+from typing import Optional
+from collections import deque
+import socket
+import select
+import errno
+import re
+
+from communication_library.exceptions import (
+    ClosedTransportError,
+    TransportTimeoutError,
+    TransportError)
+
+from communication_library.transport import (TransportOptions,
+                                                                TransportInfo,
+                                                                TransportSettings,
+                                                                Transport)
+
+
+class TcpOptions(TransportOptions):
+    def __init__(self):
+        self.address: str = '0.0.0.0/0'
+        self.port: str = '0 - 65535'
+
+
+class TcpInfo(TransportInfo):
+    def __init__(self, active: bool, transport_type: str, address: str, port: int):
+        self.status = 'Active' if active else 'Inactive'
+        self.transport_type = transport_type
+        self.address = address
+        self.port = port
+
+    def __dict__(self) -> dict:
+        return {
+            'Status': self.status,
+            'Type': self.transport_type,
+            'Address': self.address,
+            'Port': self.port
+        }
+
+
+class TcpSettings(TransportSettings):
+    def __init__(self, address: str, port: int):
+        self.address = address
+        self.port = port
+
+    @classmethod
+    def options(cls) -> TcpOptions:
+        return TcpOptions()
+
+    def validate(self):
+        ipv4_regex = re.compile(r'^((25[0-5]|(2[0-4]|1\d|[1-9]|)\d)\.?\b){4}$')
+        if re.match(ipv4_regex, self.address) is None:
+            raise ValueError(f'Address: "{self.address}" is not a valid IPV4 address')
+
+        if not 65535 >= self.port >= 0:
+            raise ValueError(f'Port: "{self.port}" is not between 0 - 65535')
+
+
+class TcpTransport(Transport):
+    def __init__(self):
+        self._receive_cache = deque()
+        self._send_cache = deque()
+        self._write_timeout = 0
+        self._read_timeout = 0
+        self._address = None
+        self._port = None
+        self._socket = None
+        self._socket_open = False
+        self._receive_cache_size = 8192
+
+    @property
+    def read_timeout(self) -> float:
+        """
+        Property for timeout of the socket read action in seconds.
+        """
+        return self._socket.timeout
+
+    @property
+    def write_timeout(self) -> float:
+        """
+        Property for timeout of the socket write action in seconds.
+        """
+        return self._socket.timeout
+
+    @classmethod
+    def options(cls) -> TcpOptions:
+        """
+        Options available to supply while establishing a transport connection.
+        """
+        return TcpSettings.options()
+
+    @property
+    def info(self) -> TcpInfo:
+        """
+        Information regarding current transport state.
+        """
+        return TcpInfo(active=self.is_open,
+                       transport_type=type(self).__name__,
+                       address=self._address,
+                       port=self._port)
+
+    @property
+    def is_open(self) -> bool:
+        """
+        Property checking if the transport is open.
+        :return: True if the transport is open, False otherwise
+        """
+        return self._socket_open
+
+    def open(self, settings: TcpSettings, read_timeout: float = 0,
+             write_timeout: Optional[float] = 1) -> None:
+        """
+        Opens socket connection with the given arguments.
+
+        The supplied parameters beside "options" are being ignored
+        they were only left here to ensure backwards compatibility
+        with code already present in the codebase.
+
+        :param settings: options required to establish a transport connection
+        :param read_timeout: read timeout in seconds, None for forever, 0 for non-blocking
+        :param write_timeout: write timeout in seconds, same as read timeout
+        """
+        try:
+            address = settings.address
+            port = settings.port
+        except ValueError:
+            raise TransportError('Socket parameters are incorrect')
+
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._socket.connect((address, port))
+        self._socket.settimeout(0)
+        self._socket_open = True
+        self._address = address
+        self._port = port
+
+    def close(self) -> None:
+        """
+        Closes the transport.
+        """
+        if hasattr(self, "_socket"):
+            self._socket.close()
+        self._socket_open = False
+
+    def write(self, data: bytes) -> None:
+        """
+        Writes bytes of data to the socket.
+        :param data: data bytes to send
+        """
+        _, writable, _ = select.select([], [self._socket], [], 0)
+        if not writable:
+            raise ClosedTransportError('Writing to a closed socket')
+        writable[0].sendall(data)
+
+    def read(self, number_of_bytes: int = 1) -> bytes:
+        """
+        Reads bytes of data from the socket. Buffer additional data.
+        :param number_of_bytes: number of bytes to be read
+        :return: requested number of bytes.
+        """
+
+        if not self._socket_open:
+            raise ClosedTransportError('Reading from a closed socket')
+
+        # If requested amount of bytes is bigger than max cache size, raise an exception
+        if number_of_bytes > self._receive_cache_size:
+            raise ValueError(
+                f'Requested amount of bytes: {number_of_bytes}, '
+                f'exceeds max cache size of: {self._receive_cache_size}. '
+                f'This read will never succeed. Please perform a smaller read.')
+
+        # If buffer has exact amount of bytes requested or bigger, return immediately skipping transport read
+        if number_of_bytes <= len(self._receive_cache):
+            return bytes(self._receive_cache.popleft() for _ in range(number_of_bytes))
+
+        # Read as many bytes as possible from transport and return requested amount
+        readable, _, _ = select.select([self._socket], [], [], 0)
+        if not readable:
+            raise TransportTimeoutError('Timeout while reading from socket')
+        try:
+            available_space = self._receive_cache_size - len(self._receive_cache)
+
+            data = readable[0].recv(available_space)
+            self._receive_cache.extend(data)
+
+        except socket.error as e:
+            if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                raise TransportTimeoutError('Timeout while reading from socket')
+            if e.errno == errno.ECONNRESET:
+                self._socket_open = False
+                raise ClosedTransportError('Reading from a closed socket')
+            raise TransportError('Received unexpected error from transport')
+
+        if not data:
+            self._socket_open = False
+            raise ClosedTransportError('Reading from a closed socket')
+
+        # Timeout if the amount read was still smaller than amount of bytes requested
+        if len(self._receive_cache) < number_of_bytes:
+            raise TransportTimeoutError('Timeout while reading from socket')
+
+        # Return requested amount of bytes
+        return bytes(self._receive_cache.popleft() for _ in range(number_of_bytes))
+
+    @property
+    def read_buffer_size(self) -> int:
+        """
+        Returns the number of bytes in the read buffer.
+        """
+        return len(self._receive_cache)
+</file>
+
+<file path="communication_library/transport.py">
+from abc import ABC, abstractmethod
+from enum import IntEnum
+
+
+class TransportType(IntEnum):
+    SERIAL = 0
+    TCP = 1
+    WEBSOCKET = 2
+
+
+class TransportOptions(ABC):
+    pass
+
+
+class TransportInfo(ABC):
+
+    @abstractmethod
+    def __dict__(self) -> dict:
+        pass
+
+
+class TransportSettings(ABC):
+
+    @classmethod
+    @abstractmethod
+    def options(cls) -> TransportOptions:
+        pass
+
+    @abstractmethod
+    def validate(self):
+        pass
+
+
+class Transport(ABC):
+
+    @property
+    @abstractmethod
+    def read_timeout(self) -> float:
+        pass
+
+    @property
+    @abstractmethod
+    def write_timeout(self) -> float:
+        pass
+
+    @classmethod
+    @abstractmethod
+    def options(cls) -> TransportOptions:
+        pass
+
+    @property
+    @abstractmethod
+    def info(self) -> TransportInfo:
+        pass
+
+    @property
+    @abstractmethod
+    def is_open(self) -> bool:
+        pass
+
+    @abstractmethod
+    def open(self, settings: TransportSettings, read_timeout: float) -> None:
+        pass
+
+    @abstractmethod
+    def close(self) -> None:
+        pass
+
+    @abstractmethod
+    def write(self, data: bytes) -> None:
+        pass
+
+    @abstractmethod
+    def read(self, number_of_bytes: int) -> bytes:
+        pass
+
+    @property
+    @abstractmethod
+    def read_buffer_size(self) -> int:
+        pass
+</file>
+
+<file path=".gitignore">
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[codz]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+#   Usually these files are written by a python script from a template
+#   before PyInstaller builds the exe, so as to inject date/other infos into it.
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py.cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff:
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+.pybuilder/
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+#   For a library or package, you might want to ignore these files since the code is
+#   intended to run in multiple environments; otherwise, check them in:
+# .python-version
+
+# pipenv
+#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
+#   However, in case of collaboration, if having platform-specific dependencies or dependencies
+#   having no cross-platform support, pipenv may install dependencies that don't work, or not
+#   install all needed dependencies.
+# Pipfile.lock
+
+# UV
+#   Similar to Pipfile.lock, it is generally recommended to include uv.lock in version control.
+#   This is especially recommended for binary packages to ensure reproducibility, and is more
+#   commonly ignored for libraries.
+# uv.lock
+
+# poetry
+#   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
+#   This is especially recommended for binary packages to ensure reproducibility, and is more
+#   commonly ignored for libraries.
+#   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
+# poetry.lock
+# poetry.toml
+
+# pdm
+#   Similar to Pipfile.lock, it is generally recommended to include pdm.lock in version control.
+#   pdm recommends including project-wide configuration in pdm.toml, but excluding .pdm-python.
+#   https://pdm-project.org/en/latest/usage/project/#working-with-version-control
+# pdm.lock
+# pdm.toml
+.pdm-python
+.pdm-build/
+
+# pixi
+#   Similar to Pipfile.lock, it is generally recommended to include pixi.lock in version control.
+# pixi.lock
+#   Pixi creates a virtual environment in the .pixi directory, just like venv module creates one
+#   in the .venv directory. It is recommended not to include this directory in version control.
+.pixi
+
+# PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
+__pypackages__/
+
+# Celery stuff
+celerybeat-schedule
+celerybeat.pid
+
+# Redis
+*.rdb
+*.aof
+*.pid
+
+# RabbitMQ
+mnesia/
+rabbitmq/
+rabbitmq-data/
+
+# ActiveMQ
+activemq-data/
+
+# SageMath parsed files
+*.sage.py
+
+# Environments
+.env
+.envrc
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# pytype static type analyzer
+.pytype/
+
+# Cython debug symbols
+cython_debug/
+
+# PyCharm
+#   JetBrains specific template is maintained in a separate JetBrains.gitignore that can
+#   be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
+#   and can be added to the global gitignore or merged into this file.  For a more nuclear
+#   option (not recommended) you can uncomment the following to ignore the entire idea folder.
+# .idea/
+
+# Abstra
+#   Abstra is an AI-powered process automation framework.
+#   Ignore directories containing user credentials, local state, and settings.
+#   Learn more at https://abstra.io/docs
+.abstra/
+
+# Visual Studio Code
+#   Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore 
+#   that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
+#   and can be added to the global gitignore or merged into this file. However, if you prefer, 
+#   you could uncomment the following to ignore the entire vscode folder
+# .vscode/
+
+# Ruff stuff:
+.ruff_cache/
+
+# PyPI configuration file
+.pypirc
+
+# Marimo
+marimo/_static/
+marimo/_lsp/
+__marimo__/
+
+# Streamlit
+.streamlit/secrets.toml
+</file>
+
+<file path=".python-version">
+3.13
+</file>
+
+<file path="frame_sending_receiving_example.py">
+from communication_library.communication_manager import CommunicationManager, TransportType
+from communication_library.tcp_transport import TcpSettings
+from communication_library.frame import Frame
+from communication_library import ids
+from communication_library.exceptions import TransportTimeoutError, TransportError, UnregisteredCallbackError
+
+def on_altitude(frame: Frame):
+    print(f"Registered frame received: {frame}")
+
+if __name__ == "__main__":
+    cm = CommunicationManager() # Class responsible for communication handling
+    cm.change_transport_type(TransportType.TCP)
+    # We must create a frame that will serve as a pattern indicating what kind of frames we want to receive
+    # During frame equality comparison the following fields are excluded: priority, data_type, payload
+    # You can find more information in communication_library/frame.py
+
+    altitude_frame = Frame(ids.BoardID.SOFTWARE, 
+                           ids.PriorityID.LOW, 
+                           ids.ActionID.FEED, 
+                           ids.BoardID.ROCKET, 
+                           ids.DeviceID.SENSOR, 
+                           2, # altitude sensor
+                           ids.DataTypeID.FLOAT,
+                           ids.OperationID.SENSOR.value.READ)
+    cm.register_callback(on_altitude, altitude_frame)
+    cm.connect(TcpSettings("127.0.0.1", 3000))
+
+    relay_open_frame = Frame(ids.BoardID.ROCKET, 
+                           ids.PriorityID.LOW, 
+                           ids.ActionID.SERVICE, 
+                           ids.BoardID.SOFTWARE, 
+                           ids.DeviceID.RELAY, 
+                           0, # oxidizer heater
+                           ids.DataTypeID.FLOAT,
+                           ids.OperationID.RELAY.value.OPEN,
+                           ()
+                           )
+    cm.push(relay_open_frame) # We need to push the frame onto the send queue
+    cm.send() # Send queue first in the send queue
+
+    servo_open_frame = relay_open_frame = Frame(ids.BoardID.ROCKET, 
+                           ids.PriorityID.LOW, 
+                           ids.ActionID.SERVICE, 
+                           ids.BoardID.SOFTWARE, 
+                           ids.DeviceID.SERVO, 
+                           1, # oxidizer intake 
+                           ids.DataTypeID.INT16,
+                           ids.OperationID.SERVO.value.POSITION,
+                           (0,) # 0 is for open position, 100 is for closed
+                           )
+    cm.push(servo_open_frame)
+    cm.send()
+
+    while True:
+        try:
+            frame = cm.receive() # We can handle frames using callbacks or by getting frame right from receive() call
+        except TransportTimeoutError:
+            pass
+        except UnregisteredCallbackError as e:
+            print(f"unregistered frame received: {e.frame}")
+</file>
+
+<file path="main.py">
+from rich.console import Console
+
+from frames import *
+
+from communication_library.communication_manager import (
+    CommunicationManager,
+    TransportType,
+)
+from communication_library.tcp_transport import TcpSettings
+from communication_library.frame import Frame
+from communication_library.exceptions import (
+    TransportTimeoutError,
+    UnregisteredCallbackError,
+)
+
+if __name__ == "__main__":
+    console = Console()
+
+
+    cm = CommunicationManager()
+    cm.change_transport_type(TransportType.TCP)
+
+    oxidizer_sequence_complete = False
+    fuel_sequence_complete = False
+    ignition_sequence_started = False
+    apogee_reached = False
+
+    last_altitude = 0.0
+
+    def on_oxidizer_level(frame: Frame):
+        global oxidizer_sequence_complete
+        if oxidizer_sequence_complete or float(frame.payload[0]) != 100:
+            return
+        oxidizer_sequence_complete = True
+        console.log("[green]Success:[/green] Oxidizer tanking complete.")
+        console.log("Opening fuel intake valve")
+        cm.push(oxidizer_intake_close)
+        cm.send()
+        cm.push(fuel_intake_open)
+        cm.send()
+
+    cm.register_callback(on_oxidizer_level, oxidizer_level_frame)
+
+    def on_fuel_level(frame: Frame):
+        global fuel_sequence_complete
+        if fuel_sequence_complete or float(frame.payload[0]) != 100:
+            return
+        fuel_sequence_complete = True
+        console.log("[green]Success:[/green] Fuel tanking complete.")
+        console.log("Activating oxidizer heater")
+        cm.push(fuel_intake_close)
+        cm.send()
+        cm.push(oxidizer_heater_on)
+        cm.send()
+
+    cm.register_callback(on_fuel_level, fuel_level_frame)
+
+    def on_oxidizer_pressure(frame: Frame):
+        global ignition_sequence_started
+        pressure = frame.payload[0]
+        if ignition_sequence_started or float(pressure) < 55:
+            return
+        ignition_sequence_started = True
+        console.log(
+            f"[bold yellow]Optimal pressure ({float(pressure):.1f} bar) reached. Commencing ignition sequence![/bold yellow]"
+        )
+        cm.push(fuel_main_open)
+        cm.send()
+        cm.push(oxidizer_main_open)
+        cm.send()
+        cm.push(igniter_on)
+        cm.send()
+        console.log("[bold red]LIFTOFF![/bold red]")
+
+    cm.register_callback(on_oxidizer_pressure, oxidizer_pressure_frame)
+
+    def on_altitude(frame: Frame):
+        global ignition_sequence_started, apogee_reached, last_altitude
+
+        current_altitude = float(frame.payload[0])
+
+        if not ignition_sequence_started or apogee_reached:
+            return
+
+        if (
+            current_altitude < last_altitude and current_altitude > 10.0
+        ):  # Check altitude > 10 to prevent launchpad trigger
+            apogee_reached = True
+            console.log(
+                f"[bold magenta]Apogee detected at {last_altitude:.1f}m.[/bold magenta]"
+            )
+            console.log("Deploying parachute for safe landing")
+            cm.push(parachute_deploy)
+            cm.send()
+
+        last_altitude = current_altitude
+
+    cm.register_callback(on_altitude, altitude_frame)
+
+    cm.connect(TcpSettings("127.0.0.1", 3000))
+    console.log("[bold]Rocket Control Script Initialized[/bold]")
+    console.log("Opening oxidizer intake valve")
+    cm.push(oxidizer_intake_open)
+    cm.send()
+
+    while True:
+        try:
+            frame = cm.receive()
+        except TransportTimeoutError:
+            pass
+        except UnregisteredCallbackError:
+            pass
+</file>
+
+<file path="README.md">
+# agh-space-systems
+</file>
+
+<file path="simulator_config.yaml">
+devices:
+  servo:
+    fuel_intake:
+      open_pos: 0
+      closed_pos: 100
+      board: "rocket"
+      device_id: 0
+    oxidizer_intake:
+      open_pos: 0
+      closed_pos: 100
+      board: "rocket"
+      device_id: 1
+    fuel_main:
+      open_pos: 0
+      closed_pos: 100
+      board: "rocket"
+      device_id: 2
+    oxidizer_main:
+      open_pos: 0
+      closed_pos: 100
+      board: "rocket"
+      device_id: 3
+
+  relay:
+    oxidizer_heater:
+      board: "rocket"
+      device_id: 0
+    igniter:
+      board: "rocket"
+      device_id: 1
+    parachute:
+      board: "rocket"
+      device_id: 2
+
+  sensor:
+    fuel_level:
+      board: "rocket"
+      device_id: 0
+      data_type: "float"
+      recording: off
+      units: "%"
+      scale: 1
+      a: 1
+      b: 0
+    oxidizer_level:
+      board: "rocket"
+      device_id: 1
+      data_type: "float"
+      recording: off
+      units: "%"
+      scale: 1
+      a: 1
+      b: 0
+    altitude:
+      board: "rocket"
+      device_id: 2
+      data_type: "float"
+      recording: off
+      units: "m"
+      scale: 1
+      a: 1
+      b: 0
+    oxidizer_pressure:
+      board: "rocket"
+      device_id: 3
+      data_type: "float"
+      recording: off
+      units: "bar"
+      scale: 1
+      a: 1
+      b: 0
+    angle:
+      board: "rocket"
+      device_id: 4
+      data_type: "float"
+      recording: off
+      units: "degrees"
+      scale: 1
+      a: 1
+      b: 0
+</file>
+
+<file path="tcp_proxy.py">
+import asyncio
+import logging
+from communication_library.protocol import GroundStationProtocol
+from communication_library.ids import HEADER_ID
+from collections import deque
+from pathlib import Path
+from os.path import join
+import sys
+from datetime import datetime
+from argparse import ArgumentParser
+
+
+class ProxyClient:
+    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        self.reader = reader
+        self.writer = writer
+        self.send_queue = deque()
+        self._should_stop = False
+
+    @property
+    def should_stop(self):
+        return self._should_stop
+
+    def get_key(self):
+        return self.reader
+
+    def stop(self):
+        self._should_stop = True
+
+    def push_data_to_send(self, data):
+        self.send_queue.append(data)
+
+    def get_data_to_send(self):
+        return self.send_queue.popleft()
+
+    async def write(self, data):
+        self.writer.write(data)
+        await self.writer.drain()
+
+    async def readexactly(self, amount):
+        return await self.reader.readexactly(amount)
+
+
+class Proxy:
+
+    def __init__(self, name):
+        self.name = name
+        self.protocol = GroundStationProtocol()
+        self.tcp_address = None
+        self.tcp_port = None
+        self.mirror_frames = False
+        self.clients = {}
+        self.setup_loggers()
+        self._logger = logging.getLogger(self.name)
+        self._send_queue = deque()
+        self._external_receive_queue = deque()
+        self._external_listeners: list[Proxy] = []
+
+    def push_data_to_send(self, data):
+        self._send_queue.append(data)
+
+    def get_data_to_send(self):
+        return self._send_queue.popleft()
+
+    def push_external_data_to_forward(self, data):
+        return self._external_receive_queue.append(data)
+
+    def get_external_data_to_forward(self):
+        return self._external_receive_queue.popleft()
+
+    def register_external_listener(self, listener):
+        self._external_listeners.append(listener)
+
+    def setup_loggers(self):
+        logger_main = logging.getLogger(self.name)
+        logger_main.setLevel(logging.DEBUG)
+
+        fmt = f'[%(asctime)s] [%(levelname)s] [{self.name.upper()}] %(message)s'
+        log_formatter = logging.Formatter(fmt=fmt)
+
+        #log_file_path = Path(sys.argv[0]).resolve().parent
+        #while log_file_path.name != 'rocket_ground_station':
+        #    log_file_path = log_file_path.parent
+        #log_file_path = log_file_path.joinpath('logs')
+        #Path(log_file_path).mkdir(parents=True, exist_ok=True)
+        #file_handler = logging.FileHandler(
+        #    join(str(log_file_path),
+        #         f'Proxy_{datetime.now().strftime("%Y_%m_%d_%H_%M_%S")}.log'))
+
+        console_handler = logging.StreamHandler(sys.stdout)
+
+        #file_handler.setFormatter(log_formatter)
+        console_handler.setFormatter(log_formatter)
+        #logger_main.addHandler(file_handler)
+        logger_main.addHandler(console_handler)
+
+    def add_client(self, reader, writer: asyncio.StreamWriter):
+        client = ProxyClient(reader, writer)
+        self.clients.update({client.get_key(): client})
+        self._logger.info('Added new client')
+        return client
+
+    def remove_client(self, client):
+        key = client.get_key()
+        if key in self.clients:
+            client.stop()
+            self.clients.pop(key)
+            self._logger.info('Removed client')
+
+    def set_tcp_server_options(self, address, port):
+        self.tcp_address = address
+        self.tcp_port = port
+        self._logger.info(f'Server listen tcp socket set to {self.tcp_address}:{self.tcp_port}')
+
+    def set_frame_mirroring(self, state):
+        self.mirror_frames = state
+        self._logger.info(f'Frame mirroring set to: {self.mirror_frames}')
+
+    # Handle receiving data from ground station and forwarding it to clients
+    async def handle_station_receive(self):
+        while True:
+
+            if not self._external_receive_queue:
+                await asyncio.sleep(0)
+                continue
+
+            data = self.get_external_data_to_forward()
+
+            clients_to_drop = []
+            for client in self.clients.values():
+                try:
+                    client.push_data_to_send(data)
+                except ConnectionResetError:
+                    clients_to_drop.append(client)
+                    continue
+            for client in clients_to_drop:
+                self.remove_client(client)
+            await asyncio.sleep(0)
+
+    async def handle_station_send(self):
+        while True:
+            if not self._send_queue:
+                await asyncio.sleep(0)
+                continue
+
+            data = self.get_data_to_send()
+
+            for listener in self._external_listeners:
+                listener.push_external_data_to_forward(data)
+
+    # Handle receiving data from client and send it to ground station
+    async def handle_client_receive(self, client):
+        while not client.should_stop:
+            try:
+                header = await client.readexactly(1)
+                if header != bytes([HEADER_ID]):
+                    self._logger.info('missing header')
+                    await asyncio.sleep(0)
+                    continue
+                raw_data = await client.readexactly(13)
+            except ConnectionResetError:
+                break
+            except ConnectionAbortedError:
+                self._logger.info('Client disconnected')
+                break
+            except asyncio.IncompleteReadError:
+                break
+
+            self.push_data_to_send(header + raw_data)
+
+            if self.mirror_frames:
+                for remote_client in self.clients.values():
+                    if client == remote_client:
+                        continue
+                    remote_client.push_data_to_send(header + raw_data)
+
+        self.remove_client(client)
+
+    # Handle sending data from ground station to client
+    async def handle_client_send(self, client: ProxyClient):
+        while not client.should_stop:
+            if not client.send_queue:
+                await asyncio.sleep(0)
+                continue
+
+            data = client.get_data_to_send()
+
+            try:
+                await client.write(data)
+            except ConnectionResetError:
+                break
+
+        self.remove_client(client)
+
+    # Handle new TCP client
+    async def handle_new_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        client = self.add_client(reader, writer)
+        asyncio.create_task(self.handle_client_receive(client))
+        asyncio.create_task(self.handle_client_send(client))
+
+    async def serve(self):
+        server = await asyncio.start_server(self.handle_new_client, self.tcp_address, self.tcp_port)
+        asyncio.create_task(self.handle_station_receive())
+        asyncio.create_task(self.handle_station_send())
+        self._logger.info(f'Listening for tcp connections on socket: {self.tcp_address}:{self.tcp_port}')
+        async with server:
+            await server.serve_forever()
+
+
+if __name__ == '__main__':
+    parser = ArgumentParser()
+    parser.add_argument('--tcp-address', default="127.0.0.1")
+    parser.add_argument('--tcp-port', default=3000)
+    cl_args = parser.parse_args()
+    software_proxy = Proxy(name='software')
+    software_proxy.set_tcp_server_options(cl_args.tcp_address, int(cl_args.tcp_port))
+    software_proxy.set_frame_mirroring(True)
+
+    hardware_proxy = Proxy(name='hardware')
+    hardware_proxy.set_tcp_server_options(cl_args.tcp_address, int(cl_args.tcp_port) + 1)
+    hardware_proxy.set_frame_mirroring(False)
+
+    software_proxy.register_external_listener(hardware_proxy)
+    hardware_proxy.register_external_listener(software_proxy)
+
+
+    async def run_proxy():
+        await asyncio.gather(software_proxy.serve(),
+                             hardware_proxy.serve())
+
+
+    asyncio.run(run_proxy())
+</file>
+
+<file path="tcp_simulator.py">
+import random
+import sys
+import time
+import os
+import yaml
+from enum import Enum
+
+from communication_library.frame import ids, Frame
+from communication_library.communication_manager import CommunicationManager, TransportType
+from communication_library.exceptions import UnregisteredCallbackError
+
+from communication_library.exceptions import TransportTimeoutError
+from communication_library.tcp_transport import TcpSettings
+
+from argparse import ArgumentParser
+
+import logging
+
+
+class SimulationState(Enum):
+    IDLE = "IDLE"
+    FILLING_OXIDIZER = "FILLING_OXIDIZER"
+    OXIDIZER_FILLED = "OXIDIZER_FILLED"
+    FILLING_FUEL = "FILLING_FUEL"
+    FUEL_FILLED = "FUEL_FILLED"
+    HEATING = "HEATING"
+    READY_TO_LAUNCH = "READY_TO_LAUNCH"
+    IGNITION_SEQUENCE = "IGNITION_SEQUENCE"
+    FLIGHT = "FLIGHT"
+    APOGEE = "APOGEE"
+    PARACHUTE_DEPLOYED = "PARACHUTE_DEPLOYED"
+    FREEFALL = "FREEFALL"
+    EXPLOSION = "EXPLOSION"
+    LANDED = "LANDED"
+
+
+class StandaloneMock:
+    def __init__(self, proxy_address: str,
+                 proxy_port: int,
+                 hardware_config: str,
+                 feed_send_interval: float,
+                 no_print: bool,
+                 verbose: bool,
+                 time_multiplier: float):
+        
+        with open(hardware_config, 'r') as config_file:
+            self.config = yaml.safe_load(config_file)
+        
+        self.manager = CommunicationManager()
+        self.manager.change_transport_type(TransportType.TCP)
+        self.manager.connect(TcpSettings(address=proxy_address, port=proxy_port))
+        self.setup_loggers()
+        self._logger = logging.getLogger("main")
+        self.feed_send_delay = feed_send_interval
+        self.no_print = no_print
+        self.verbose = verbose
+        self.time_multiplier = time_multiplier
+        self.last_feed_update = time.perf_counter()
+        self.last_physics_update = time.perf_counter()
+        self.last_status_print = time.perf_counter()
+        self.should_run = True
+        
+        self.state = SimulationState.IDLE
+        
+        self.servos = {}
+        for servo_name, servo_config in self.config['devices']['servo'].items():
+            self.servos[servo_name] = servo_config['closed_pos']
+        
+        self.relays = {}
+        for relay_name in self.config['devices']['relay'].keys():
+            self.relays[relay_name] = 0
+        
+        self.sensors = {
+            'fuel_level': 0.0,
+            'oxidizer_level': 0.0,
+            'altitude': 0.0,
+            'oxidizer_pressure': 0.0,
+            'angle': 2.0
+        }
+        
+        self.oxidizer_filled = False
+        self.fuel_filled = False
+        self.fuel_main_open_time = None
+        self.oxidizer_main_open_time = None
+        self.igniter_start_time = None
+        self.apogee_reached_time = None
+        self.max_altitude = 0.0
+        self.velocity = 0.0
+        self.thrust_multiplier = 1.0
+
+        self._logger.info(
+            f'Rocket simulator is running connected to {proxy_address}:{proxy_port}')
+        self._logger.info(f'State: {self.state.value}')
+
+    def setup_loggers(self):
+        logger_main = logging.getLogger("main")
+        logger_main.setLevel(logging.DEBUG)
+
+        fmt = '[%(asctime)s] [%(levelname)s] %(message)s'
+        log_formatter = logging.Formatter(fmt=fmt)
+
+        console_handler = logging.StreamHandler(sys.stdout)
+
+        console_handler.setFormatter(log_formatter)
+        logger_main.addHandler(console_handler)
+
+    def print_rocket_status(self):
+        self._logger.info("=" * 60)
+        self._logger.info("ROCKET STATUS:")
+        self._logger.info(f"  State: {self.state.value}")
+        self._logger.info(f"  Sensors:")
+        self._logger.info(f"    - Fuel Level: {self.sensors['fuel_level']:.1f}%")
+        self._logger.info(f"    - Oxidizer Level: {self.sensors['oxidizer_level']:.1f}%")
+        self._logger.info(f"    - Oxidizer Pressure: {self.sensors['oxidizer_pressure']:.1f} bar")
+        self._logger.info(f"    - Altitude: {self.sensors['altitude']:.1f} m")
+        self._logger.info(f"    - Angle: {self.sensors['angle']:.1f}°")
+        self._logger.info(f"  Servos:")
+        for servo_name, position in self.servos.items():
+            self._logger.info(f"    - {servo_name}: {position}")
+        self._logger.info(f"  Relays:")
+        for relay_name, state in self.relays.items():
+            self._logger.info(f"    - {relay_name}: {'OPEN' if state else 'CLOSED'}")
+        self._logger.info(f"  Velocity: {self.velocity:.2f} m/s")
+        self._logger.info("=" * 60)
+
+    def explode(self, reason: str):
+        self.state = SimulationState.EXPLOSION
+        self._logger.error(f'EXPLOSION: {reason}')
+        self.print_rocket_status()
+        self._logger.error('Simulation ended.')
+        time.sleep(2)
+        self.should_run = False
+
+    def handle_frame(self, _frame) -> list[Frame]:
+        output_frames = []
+        handled = False
+        
+        if self.verbose:
+            self._logger.info(f'Received frame: {_frame}')
+        
+        if _frame.device_type == ids.DeviceID.SERVO:
+            servo_name = self.get_servo_name(_frame.device_id)
+            if servo_name:
+                if _frame.operation == ids.OperationID.SERVO.value.POSITION:
+                    old_val = self.servos[servo_name]
+                    new_position = int(_frame.data)
+                    self.servos[servo_name] = new_position
+                    
+                    servo_config = self.config['devices']['servo'][servo_name]
+                    open_pos = servo_config['open_pos']
+                    closed_pos = servo_config['closed_pos']
+                    
+                    self._logger.info(f'{servo_name} position set to {new_position} (was {old_val})')
+                    
+                    if abs(new_position - open_pos) < abs(new_position - closed_pos):
+                        if servo_name == 'fuel_main':
+                            self.fuel_main_open_time = time.perf_counter()
+                        elif servo_name == 'oxidizer_main':
+                            self.oxidizer_main_open_time = time.perf_counter()
+                    else:
+                        if servo_name == 'fuel_main':
+                            self.fuel_main_open_time = None
+                        elif servo_name == 'oxidizer_main':
+                            self.oxidizer_main_open_time = None
+                    
+                    handled = True
+                else:
+                    self._logger.warning(f'Unknown servo operation {_frame.operation} for {servo_name}')
+            else:
+                self._logger.warning(f'Unknown servo device_id {_frame.device_id}')
+            
+            if handled:
+                replacements = {
+                    'destination': _frame.source,
+                    'source': _frame.destination,
+                    'action': ids.ActionID.ACK
+                }
+                output_frames.append(Frame(**{**_frame.as_dict(), **replacements}))
+        
+        elif _frame.device_type == ids.DeviceID.RELAY:
+            relay_name = self.get_relay_name(_frame.device_id)
+            if relay_name:
+                if _frame.operation == ids.OperationID.RELAY.value.OPEN:
+                    old_val = self.relays[relay_name]
+                    self.relays[relay_name] = 1
+                    self._logger.info(f'{relay_name} relay opened (was {old_val}, now 1)')
+                    
+                    if relay_name == 'igniter':
+                        self.igniter_start_time = time.perf_counter()
+                    
+                    handled = True
+                        
+                elif _frame.operation == ids.OperationID.RELAY.value.CLOSE:
+                    old_val = self.relays[relay_name]
+                    self.relays[relay_name] = 0
+                    self._logger.info(f'{relay_name} relay closed (was {old_val}, now 0)')
+                    
+                    if relay_name == 'igniter':
+                        self.igniter_start_time = None
+                    
+                    handled = True
+                else:
+                    self._logger.warning(f'Unknown relay operation {_frame.operation} for {relay_name}')
+            else:
+                self._logger.warning(f'Unknown relay device_id {_frame.device_id}')
+            
+            if handled:
+                replacements = {
+                    'destination': _frame.source,
+                    'source': _frame.destination,
+                    'action': ids.ActionID.ACK
+                }
+                output_frames.append(Frame(**{**_frame.as_dict(), **replacements}))
+        
+        else:
+            self._logger.warning(f'Unknown device_type {_frame.device_type}')
+        
+        return output_frames
+
+    def get_servo_name(self, device_id):
+        for name, settings in self.config['devices']['servo'].items():
+            if settings['device_id'] == device_id:
+                return name
+        return None
+    
+    def get_relay_name(self, device_id):
+        for name, settings in self.config['devices']['relay'].items():
+            if settings['device_id'] == device_id:
+                return name
+        return None
+
+    def is_servo_open(self, servo_name: str) -> bool:
+        servo_config = self.config['devices']['servo'][servo_name]
+        open_pos = servo_config['open_pos']
+        closed_pos = servo_config['closed_pos']
+        current_pos = self.servos[servo_name]
+        
+        threshold = abs(open_pos - closed_pos) * 0.3
+        return abs(current_pos - open_pos) < threshold
+
+    def update_physics(self, dt: float):
+        old_state = self.state
+        
+        if self.state == SimulationState.IDLE:
+            if self.is_servo_open('fuel_intake'):
+                self._logger.warning('PROPELLANT LOADING VIOLATION: Fuel intake opened before oxidizer is filled!')
+                self._logger.warning('Correct procedure: Fill oxidizer tank first, then fuel tank.')
+            elif self.is_servo_open('oxidizer_intake'):
+                self.state = SimulationState.FILLING_OXIDIZER
+                self._logger.info(f'State: {self.state.value}')
+                self.print_rocket_status()
+        
+        elif self.state == SimulationState.FILLING_OXIDIZER:
+            if self.is_servo_open('fuel_intake'):
+                self._logger.warning('PROPELLANT LOADING VIOLATION: Fuel intake opened before oxidizer is fully filled!')
+                self._logger.warning('Correct procedure: Complete oxidizer filling first.')
+            
+            if self.is_servo_open('oxidizer_intake'):
+                self.sensors['oxidizer_level'] = min(100.0, self.sensors['oxidizer_level'] + dt * 10.0)
+                self.sensors['oxidizer_pressure'] = min(40.0, self.sensors['oxidizer_pressure'] + dt * 2.0)
+                
+                if self.sensors['oxidizer_level'] >= 100.0:
+                    self.state = SimulationState.OXIDIZER_FILLED
+                    self._logger.info(f'State: {self.state.value}')
+                    self.print_rocket_status()
+            else:
+                if self.sensors['oxidizer_level'] >= 100.0:
+                    self.state = SimulationState.OXIDIZER_FILLED
+                    self._logger.info(f'State: {self.state.value}')
+                    self.print_rocket_status()
+                else:
+                    self.sensors['oxidizer_pressure'] = max(0.0, self.sensors['oxidizer_pressure'] - dt * 1.0)
+        
+        elif self.state == SimulationState.OXIDIZER_FILLED:
+            if self.relays['oxidizer_heater'] == 1:
+                self.sensors['oxidizer_pressure'] = min(90.0, self.sensors['oxidizer_pressure'] + dt * 2.5)
+                if self.sensors['oxidizer_pressure'] >= 90.0:
+                    self.explode("Oxidizer pressure too high (90 bars) - tank explosion")
+                    return
+            else:
+                self.sensors['oxidizer_pressure'] = max(30.0, self.sensors['oxidizer_pressure'] - dt * 1.0)
+            
+            if self.is_servo_open('fuel_intake'):
+                self.state = SimulationState.FILLING_FUEL
+                self._logger.info(f'State: {self.state.value}')
+                self.print_rocket_status()
+        
+        elif self.state == SimulationState.FILLING_FUEL:
+            if self.relays['oxidizer_heater'] == 1:
+                self.sensors['oxidizer_pressure'] = min(90.0, self.sensors['oxidizer_pressure'] + dt * 2.5)
+                if self.sensors['oxidizer_pressure'] >= 90.0:
+                    self.explode("Oxidizer pressure too high (90 bars) - tank explosion")
+                    return
+            else:
+                self.sensors['oxidizer_pressure'] = max(30.0, self.sensors['oxidizer_pressure'] - dt * 1.0)
+            
+            if self.is_servo_open('fuel_intake'):
+                self.sensors['fuel_level'] = min(100.0, self.sensors['fuel_level'] + dt * 10.0)
+                
+                if self.sensors['fuel_level'] >= 100.0:
+                    self.state = SimulationState.FUEL_FILLED
+                    self._logger.info(f'State: {self.state.value}')
+                    self.print_rocket_status()
+            else:
+                if self.sensors['fuel_level'] >= 100.0:
+                    self.state = SimulationState.FUEL_FILLED
+                    self._logger.info(f'State: {self.state.value}')
+                    self.print_rocket_status()
+        
+        elif self.state == SimulationState.FUEL_FILLED:
+            if self.relays['oxidizer_heater'] == 1:
+                self.sensors['oxidizer_pressure'] = min(90.0, self.sensors['oxidizer_pressure'] + dt * 2.5)
+                if self.sensors['oxidizer_pressure'] >= 90.0:
+                    self.explode("Oxidizer pressure too high (90 bars) - tank explosion")
+                    return
+            else:
+                self.sensors['oxidizer_pressure'] = max(30.0, self.sensors['oxidizer_pressure'] - dt * 1.0)
+            
+            if self.fuel_main_open_time and self.oxidizer_main_open_time:
+                time_diff = abs(self.fuel_main_open_time - self.oxidizer_main_open_time)
+                if time_diff > 1.0:
+                    if self.igniter_start_time:
+                        self.explode("Main valves opened with >1s difference - propellant imbalance explosion")
+                        return
+                
+                if self.igniter_start_time:
+                    igniter_delay_fuel = abs(self.igniter_start_time - self.fuel_main_open_time)
+                    igniter_delay_ox = abs(self.igniter_start_time - self.oxidizer_main_open_time)
+                    
+                    if igniter_delay_fuel > 1.0 or igniter_delay_ox > 1.0:
+                        self.explode("Igniter started >1s after main valves - engine flooded")
+                        return
+                    
+                    if self.igniter_start_time < min(self.fuel_main_open_time, self.oxidizer_main_open_time):
+                        self.explode("Igniter started before main valves - single propellant combustion")
+                        return
+                    
+                    if self.is_servo_open('fuel_intake') or self.is_servo_open('oxidizer_intake'):
+                        self.explode("Intake valves still open during ignition - catastrophic pressure loss")
+                        return
+                    
+                    pressure = self.sensors['oxidizer_pressure']
+                    
+                    if pressure < 40.0:
+                        self._logger.error(f"Ignition failed: Oxidizer pressure too low ({pressure:.1f} bars) - engine won't ignite")
+                        self.igniter_start_time = None
+                        return
+                    
+                    if pressure > 65.0:
+                        self.explode(f"Oxidizer pressure too high at ignition ({pressure:.1f} bars) - engine explosion")
+                        return
+                    
+                    if 55.0 <= pressure <= 65.0:
+                        self.thrust_multiplier = 1.0
+                        self._logger.info(f"Optimal pressure {pressure:.1f} bars - full thrust!")
+                    else:
+                        pressure_deviation = min(abs(pressure - 55.0), abs(pressure - 65.0))
+                        self.thrust_multiplier = max(0.5, 1.0 - (pressure_deviation / 15.0) * 0.5)
+                        self._logger.warning(f"Suboptimal pressure {pressure:.1f} bars - thrust reduced to {self.thrust_multiplier*100:.0f}%")
+                    
+                    self.state = SimulationState.FLIGHT
+                    self._logger.info(f'State: {self.state.value} - Engine ignited successfully!')
+                    self.print_rocket_status()
+        
+        elif self.state == SimulationState.FLIGHT:
+            if self.sensors['fuel_level'] > 0:
+                if self.relays['parachute'] == 1:
+                    self.explode("Parachute opened while engine is running - structural failure")
+                    return
+                
+                burn_rate = dt * 8.0
+                self.sensors['fuel_level'] = max(0.0, self.sensors['fuel_level'] - burn_rate)
+                self.sensors['oxidizer_level'] = max(0.0, self.sensors['oxidizer_level'] - burn_rate)
+                self.sensors['oxidizer_pressure'] = max(30.0, self.sensors['oxidizer_pressure'] - dt * 3.0)
+                
+                thrust = 15.0 * self.thrust_multiplier
+                gravity = 9.81
+                acceleration = thrust - gravity
+                self.velocity += acceleration * dt
+                self.sensors['altitude'] += self.velocity * dt
+                
+                self.sensors['angle'] = min(30.0, self.sensors['angle'] + dt * 2.0)
+            else:
+                if self.relays['parachute'] == 1:
+                    if self.velocity > 30.0:
+                        self._logger.error(f'Parachute deployed at too high velocity ({self.velocity:.1f} m/s) during ascent - parachute ripped!')
+                        self._logger.error('Continuing ballistic trajectory...')
+                    else:
+                        self.state = SimulationState.PARACHUTE_DEPLOYED
+                        self._logger.info(f'State: {self.state.value} - Early parachute deployment')
+                        self.print_rocket_status()
+                        return
+                
+                self.velocity -= 9.81 * dt
+                self.sensors['altitude'] += self.velocity * dt
+                
+                self.sensors['angle'] = min(90.0, self.sensors['angle'] + dt * 15.0)
+                
+                if self.sensors['altitude'] > self.max_altitude:
+                    self.max_altitude = self.sensors['altitude']
+                
+                if self.velocity <= 0 and self.apogee_reached_time is None:
+                    self.apogee_reached_time = time.perf_counter()
+                    self.state = SimulationState.APOGEE
+                    self._logger.info(f'State: {self.state.value} - Maximum altitude: {self.sensors["altitude"]:.2f}m')
+                    self.print_rocket_status()
+        
+        elif self.state == SimulationState.APOGEE:
+            time_since_apogee = time.perf_counter() - self.apogee_reached_time
+            
+            self.sensors['angle'] = min(180.0, self.sensors['angle'] + dt * 20.0)
+            
+            if self.relays['parachute'] == 1:
+                self.state = SimulationState.PARACHUTE_DEPLOYED
+                self._logger.info(f'State: {self.state.value}')
+                self.print_rocket_status()
+            elif time_since_apogee > 10.0:
+                self.state = SimulationState.FREEFALL
+                self._logger.info(f'State: {self.state.value} - Parachute not deployed in time!')
+                self.print_rocket_status()
+            else:
+                self.velocity -= 9.81 * dt
+                self.sensors['altitude'] += self.velocity * dt
+        
+        elif self.state == SimulationState.PARACHUTE_DEPLOYED:
+            terminal_velocity = -5.0
+            self.velocity = max(terminal_velocity, self.velocity - 9.81 * dt)
+            self.sensors['altitude'] += self.velocity * dt
+            
+            if self.sensors['angle'] > 0:
+                self.sensors['angle'] = max(0.0, self.sensors['angle'] - dt * 30.0)
+            elif self.sensors['angle'] < 0:
+                self.sensors['angle'] = min(0.0, self.sensors['angle'] + dt * 30.0)
+            
+            if self.sensors['altitude'] <= 0:
+                self.sensors['altitude'] = 0.0
+                self.velocity = 0.0
+                self.state = SimulationState.LANDED
+                self._logger.info(f'State: {self.state.value} - Successful landing!')
+                self.print_rocket_status()
+                time.sleep(2)
+                self.should_run = False
+        
+        elif self.state == SimulationState.FREEFALL:
+            self.velocity -= 9.81 * dt
+            self.sensors['altitude'] += self.velocity * dt
+            
+            self.sensors['angle'] = min(180.0, self.sensors['angle'] + dt * 20.0)
+            
+            if self.relays['parachute'] == 1:
+                if abs(self.velocity) > 30.0:
+                    self._logger.error(f'Parachute deployed at too high velocity ({abs(self.velocity):.1f} m/s) - parachute ripped!')
+                    self._logger.error('Continuing freefall...')
+                else:
+                    self.state = SimulationState.PARACHUTE_DEPLOYED
+                    self._logger.info(f'State: {self.state.value} - Late parachute deployment successful')
+                    self.print_rocket_status()
+            
+            if self.sensors['altitude'] <= 0:
+                self.sensors['altitude'] = 0.0
+                self.velocity = 0.0
+                self.state = SimulationState.LANDED
+                self._logger.error(f'State: {self.state.value} - CRASH LANDING!')
+                self.print_rocket_status()
+                time.sleep(2)
+                self.should_run = False
+
+    def send_feed_frame(self):
+        conf_dict = self.config
+        sensors_config: dict = conf_dict["devices"]["sensor"]
+
+        for sensor_name, sensor_settings in sensors_config.items():
+            source = ids.BoardID[sensor_settings["board"].upper()]
+            device_id = sensor_settings["device_id"]
+            data_type = ids.DataTypeID[sensor_settings["data_type"].upper()]
+            
+            if sensor_name in self.sensors:
+                value = self.sensors[sensor_name]
+            else:
+                value = 0.0
+
+            frame = Frame(destination=ids.BoardID.SOFTWARE,
+                          priority=ids.PriorityID.LOW,
+                          action=ids.ActionID.FEED,
+                          source=source,
+                          device_type=ids.DeviceID.SENSOR,
+                          device_id=device_id,
+                          data_type=data_type,
+                          operation=ids.OperationID.SENSOR.value.READ,
+                          payload=(value,))
+            self.manager.push(frame)
+            try:
+                self.manager.send()
+            except TransportTimeoutError:
+                break
+
+            if self.verbose:
+                self._logger.info(f"sent feed frame: {frame}")
+
+        servos_config: dict = conf_dict["devices"]["servo"]
+        for servo_name, servo_settings in servos_config.items():
+            source = ids.BoardID[servo_settings["board"].upper()]
+            device_id = servo_settings["device_id"]
+            data_type = ids.DataTypeID.INT16
+            
+            if servo_name in self.servos:
+                value = int(self.servos[servo_name])
+            else:
+                value = 0
+
+            frame = Frame(destination=ids.BoardID.SOFTWARE,
+                          priority=ids.PriorityID.LOW,
+                          action=ids.ActionID.FEED,
+                          source=source,
+                          device_type=ids.DeviceID.SERVO,
+                          device_id=device_id,
+                          data_type=data_type,
+                          operation=ids.OperationID.SERVO.value.POSITION,
+                          payload=(value,))
+            self.manager.push(frame)
+            try:
+                self.manager.send()
+            except TransportTimeoutError:
+                break
+
+            if self.verbose:
+                self._logger.info(f"sent feed frame: {frame}")
+
+    def receive_send_loop(self):
+        while self.should_run:
+            current_time = time.perf_counter()
+            
+            if current_time > self.last_physics_update + 0.1:
+                dt = (current_time - self.last_physics_update) * self.time_multiplier
+                self.update_physics(dt)
+                self.last_physics_update = current_time
+            
+            if not self.verbose and current_time > self.last_status_print + 1.0:
+                self.print_rocket_status()
+                self.last_status_print = current_time
+            
+            try:
+                frame = self.manager.receive()
+            except TransportTimeoutError:
+                if current_time > self.last_feed_update + float(self.feed_send_delay):
+                    self.send_feed_frame()
+                    self.last_feed_update = current_time
+                continue
+            except UnregisteredCallbackError as e:
+                frame = e.frame
+            except KeyboardInterrupt:
+                sys.exit()
+
+            for response_frame in self.handle_frame(frame):
+                self.manager.push(response_frame)
+                if self.verbose:
+                    self._logger.info(f"pushed frame: {response_frame}")
+                try:
+                    self.manager.send()
+                except TransportTimeoutError:
+                    continue
+            
+            if current_time > self.last_feed_update + float(self.feed_send_delay):
+                self.send_feed_frame()
+                self.last_feed_update = current_time
+
+
+if __name__ == "__main__":
+    parser = ArgumentParser()
+    parser.add_argument('--proxy-address', default="127.0.0.1")
+    parser.add_argument('--proxy-port', default=3001)
+    parser.add_argument('--feed-interval', default=1)
+    parser.add_argument('--hardware-config', default='simulator_config.yaml')
+    parser.add_argument('--no-print', default=False, action='store_true')
+    parser.add_argument('--verbose', default=False, action='store_true', 
+                        help='Print all frames sent/received. If disabled, prints rocket status every second.')
+    parser.add_argument('--time-multiplier', default=1.0, type=float,
+                        help='Simulation speed multiplier. 1.0 = real-time, 2.0 = 2x faster, 0.5 = 2x slower.')
+    cl_args = parser.parse_args()
+    standalone_mock = StandaloneMock(cl_args.proxy_address,
+                                     int(cl_args.proxy_port),
+                                     cl_args.hardware_config,
+                                     cl_args.feed_interval,
+                                     cl_args.no_print,
+                                     cl_args.verbose,
+                                     cl_args.time_multiplier)
+    standalone_mock.receive_send_loop()
+</file>
+
+<file path="ui.py">
+from nicegui import ui, app
+
+from frames import *
+
+from communication_library.communication_manager import (
+    CommunicationManager,
+    TransportType,
+)
+from communication_library.tcp_transport import TcpSettings
+from communication_library.frame import Frame
+from communication_library.exceptions import (
+    TransportTimeoutError,
+    UnregisteredCallbackError,
+)
+
+cm = CommunicationManager()
+cm.change_transport_type(TransportType.TCP)
+
+oxidizer_level = 0.0
+fuel_level = 0.0
+oxidizer_pressure = 0.0
+altitude = 0.0
+angle = 0.0
+
+oxidizer_sequence_complete = False
+fuel_sequence_complete = False
+ignition_sequence_started = False
+apogee_reached = False
+
+ui.label("Rocket Control Panel").classes('text-h4')
+
+with ui.card().classes('w-full'):
+    ox_level_label = ui.label(f'Oxidizer: {oxidizer_level:.1f}%')
+    # Set show_value=False to hide the text on the progress bar
+    ox_level_progress = ui.linear_progress(value=0.0, show_value=False, color='cyan')
+
+    fuel_level_label = ui.label(f'Fuel: {fuel_level:.1f}%')
+    # Set show_value=False to hide the text on the progress bar
+    fuel_level_progress = ui.linear_progress(value=0.0, show_value=False, color='yellow')
+
+    pressure_label = ui.label(f'Pressure: {oxidizer_pressure:.1f} bar')
+    # Set show_value=False to hide the text on the progress bar
+    pressure_progress = ui.linear_progress(value=0.0, show_value=False, color='red')
+
+    altitude_label = ui.label(f'Altitude: {altitude:.1f} m')
+    angle_label = ui.label(f'Angle: {angle:.1f}°')
+
+def on_oxidizer_level_update(frame: Frame):
+    global oxidizer_level
+    oxidizer_level = float(frame.payload[0])
+
+def on_fuel_level_update(frame: Frame):
+    global fuel_level
+    fuel_level = float(frame.payload[0])
+
+def on_oxidizer_pressure_update(frame: Frame):
+    global oxidizer_pressure
+    oxidizer_pressure = float(frame.payload[0])
+
+def on_altitude_update(frame: Frame):
+    global altitude
+    altitude = float(frame.payload[0])
+
+def on_angle_update(frame: Frame):
+    global angle
+    angle = float(frame.payload[0])
+
+
+def start_mission():
+    global cm
+    # Register the simple data-updating callbacks once
+    cm.register_callback(on_oxidizer_level_update, oxidizer_level_frame)
+    cm.register_callback(on_fuel_level_update, fuel_level_frame)
+    cm.register_callback(on_oxidizer_pressure_update, oxidizer_pressure_frame)
+    cm.register_callback(on_altitude_update, altitude_frame)
+    cm.register_callback(on_angle_update, angle_frame)
+
+    # Connect to the simulator and start the sequence
+    cm.connect(TcpSettings("127.0.0.1", 3000))
+    cm.push(oxidizer_intake_open)
+    cm.send()
+    
+    # Start the main loop
+    ui.timer(0.1, main_loop)
+    ui.notify('Mission Started: Opening oxidizer intake valve.', color='positive')
+
+# --- Main Application Loop ---
+def main_loop():
+    global oxidizer_sequence_complete, fuel_sequence_complete, ignition_sequence_started, apogee_reached
+
+    # 1. Process any incoming messages, which will trigger the simple callbacks
+    try:
+        cm.receive()
+    except (TransportTimeoutError, UnregisteredCallbackError):
+        pass
+
+    # 2. Update all UI elements with the latest data from the global variables
+    ox_level_label.set_text(f'Oxidizer: {oxidizer_level:.1f}%')
+    ox_level_progress.set_value(oxidizer_level / 100) # Progress bar value is 0.0 to 1.0
+
+    fuel_level_label.set_text(f'Fuel: {fuel_level:.1f}%')
+    fuel_level_progress.set_value(fuel_level / 100)
+
+    pressure_label.set_text(f'Pressure: {oxidizer_pressure:.1f} bar')
+    pressure_progress.set_value(oxidizer_pressure / 70)
+
+    altitude_label.set_text(f'Altitude: {altitude:.1f} m')
+    angle_label.set_text(f'Angle: {angle:.1f}°')
+
+    # 3. Execute the state machine logic based on the current data
+    # Step 1: Oxidizer Tanking
+    if not oxidizer_sequence_complete and oxidizer_level == 100:
+        oxidizer_sequence_complete = True
+        ui.notify('Oxidizer tanking complete. Opening fuel intake.', color='info')
+        cm.push(oxidizer_intake_close)
+        cm.send()
+        cm.push(fuel_intake_open)
+        cm.send()
+
+    # Step 2: Fuel Tanking
+    if oxidizer_sequence_complete and not fuel_sequence_complete and fuel_level == 100:
+        fuel_sequence_complete = True
+        ui.notify('Fuel tanking complete. Activating oxidizer heater.', color='info')
+        cm.push(fuel_intake_close)
+        cm.send()
+        cm.push(oxidizer_heater_on)
+        cm.send()
+
+    # Step 3: Ignition
+    if fuel_sequence_complete and not ignition_sequence_started and oxidizer_pressure >= 55:
+        ignition_sequence_started = True
+        ui.notify(f'Optimal pressure ({oxidizer_pressure:.1f} bar) reached. LIFTOFF!', color='accent')
+        cm.push(fuel_main_open)
+        cm.send()
+        cm.push(oxidizer_main_open)
+        cm.send()
+        cm.push(igniter_on)
+        cm.send()
+
+    # Step 4: Apogee Detection and Landing
+    if ignition_sequence_started and not apogee_reached and angle >= 90:
+        apogee_reached = True
+        ui.notify(f'Apogee detected at angle {angle:.1f}°. Deploying parachute.', color='purple')
+        cm.push(parachute_deploy)
+        cm.send()
+
+# --- Start Button ---
+ui.button("Start Mission", on_click=start_mission)
+
+ui.run()
+</file>
+
+<file path="frames.py">
+from communication_library.frame import Frame
+from communication_library import ids
+
+oxidizer_intake_open = Frame(
+    ids.BoardID.ROCKET,
+    ids.PriorityID.LOW,
+    ids.ActionID.SERVICE,
+    ids.BoardID.SOFTWARE,
+    ids.DeviceID.SERVO,
+    1,
+    ids.DataTypeID.INT16,
+    ids.OperationID.SERVO.value.POSITION,
+    (0,),
+)
+oxidizer_intake_close = Frame(
+    ids.BoardID.ROCKET,
+    ids.PriorityID.LOW,
+    ids.ActionID.SERVICE,
+    ids.BoardID.SOFTWARE,
+    ids.DeviceID.SERVO,
+    1,
+    ids.DataTypeID.INT16,
+    ids.OperationID.SERVO.value.POSITION,
+    (100,),
+)
+fuel_intake_open = Frame(
+    ids.BoardID.ROCKET,
+    ids.PriorityID.LOW,
+    ids.ActionID.SERVICE,
+    ids.BoardID.SOFTWARE,
+    ids.DeviceID.SERVO,
+    0,
+    ids.DataTypeID.INT16,
+    ids.OperationID.SERVO.value.POSITION,
+    (0,),
+)
+fuel_intake_close = Frame(
+    ids.BoardID.ROCKET,
+    ids.PriorityID.LOW,
+    ids.ActionID.SERVICE,
+    ids.BoardID.SOFTWARE,
+    ids.DeviceID.SERVO,
+    0,
+    ids.DataTypeID.INT16,
+    ids.OperationID.SERVO.value.POSITION,
+    (100,),
+)
+oxidizer_heater_on = Frame(
+    ids.BoardID.ROCKET,
+    ids.PriorityID.LOW,
+    ids.ActionID.SERVICE,
+    ids.BoardID.SOFTWARE,
+    ids.DeviceID.RELAY,
+    0,
+    ids.DataTypeID.NO_DATA,
+    ids.OperationID.RELAY.value.OPEN,
+)
+fuel_main_open = Frame(
+    ids.BoardID.ROCKET,
+    ids.PriorityID.HIGH,
+    ids.ActionID.SERVICE,
+    ids.BoardID.SOFTWARE,
+    ids.DeviceID.SERVO,
+    2,
+    ids.DataTypeID.INT16,
+    ids.OperationID.SERVO.value.POSITION,
+    (0,),
+)
+oxidizer_main_open = Frame(
+    ids.BoardID.ROCKET,
+    ids.PriorityID.HIGH,
+    ids.ActionID.SERVICE,
+    ids.BoardID.SOFTWARE,
+    ids.DeviceID.SERVO,
+    3,
+    ids.DataTypeID.INT16,
+    ids.OperationID.SERVO.value.POSITION,
+    (0,),
+)
+igniter_on = Frame(
+    ids.BoardID.ROCKET,
+    ids.PriorityID.HIGH,
+    ids.ActionID.SERVICE,
+    ids.BoardID.SOFTWARE,
+    ids.DeviceID.RELAY,
+    1,
+    ids.DataTypeID.NO_DATA,
+    ids.OperationID.RELAY.value.OPEN,
+)
+parachute_deploy = Frame(
+    ids.BoardID.ROCKET,
+    ids.PriorityID.HIGH,
+    ids.ActionID.SERVICE,
+    ids.BoardID.SOFTWARE,
+    ids.DeviceID.RELAY,
+    2,
+    ids.DataTypeID.NO_DATA,
+    ids.OperationID.RELAY.value.OPEN,
+)
+oxidizer_level_frame = Frame(
+    ids.BoardID.SOFTWARE,
+    ids.PriorityID.LOW,
+    ids.ActionID.FEED,
+    ids.BoardID.ROCKET,
+    ids.DeviceID.SENSOR,
+    1,
+    ids.DataTypeID.FLOAT,
+    ids.OperationID.SENSOR.value.READ,
+)
+fuel_level_frame = Frame(
+    ids.BoardID.SOFTWARE,
+    ids.PriorityID.LOW,
+    ids.ActionID.FEED,
+    ids.BoardID.ROCKET,
+    ids.DeviceID.SENSOR,
+    0,
+    ids.DataTypeID.FLOAT,
+    ids.OperationID.SENSOR.value.READ,
+)
+oxidizer_pressure_frame = Frame(
+    ids.BoardID.SOFTWARE,
+    ids.PriorityID.LOW,
+    ids.ActionID.FEED,
+    ids.BoardID.ROCKET,
+    ids.DeviceID.SENSOR,
+    3,
+    ids.DataTypeID.FLOAT,
+    ids.OperationID.SENSOR.value.READ,
+)
+altitude_frame = Frame(
+    ids.BoardID.SOFTWARE,
+    ids.PriorityID.LOW,
+    ids.ActionID.FEED,
+    ids.BoardID.ROCKET,
+    ids.DeviceID.SENSOR,
+    2,
+    ids.DataTypeID.FLOAT,
+    ids.OperationID.SENSOR.value.READ,
+)
+angle_frame = Frame(
+    ids.BoardID.SOFTWARE,
+    ids.PriorityID.LOW,
+    ids.ActionID.FEED,
+    ids.BoardID.ROCKET,
+    ids.DeviceID.SENSOR,
+    4,
+    ids.DataTypeID.FLOAT,
+    ids.OperationID.SENSOR.value.READ,
+)
+</file>
+
+<file path="pyproject.toml">
+[project]
+name = "agh-space"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "bitstruct>=8.21.0",
+    "crccheck>=1.3.1",
+    "nicegui>=3.1.0",
+    "pyyaml>=6.0.3",
+    "rich>=14.2.0",
+]
+</file>
+
+</files>
