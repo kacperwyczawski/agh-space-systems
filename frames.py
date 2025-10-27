@@ -147,3 +147,43 @@ angle_frame = Frame(
     ids.DataTypeID.FLOAT,
     ids.OperationID.SENSOR.value.READ,
 )
+servo_fuel_intake_frame = Frame(
+    ids.BoardID.SOFTWARE,
+    ids.PriorityID.LOW,
+    ids.ActionID.FEED,
+    ids.BoardID.ROCKET,
+    ids.DeviceID.SERVO,
+    0,
+    ids.DataTypeID.INT16,
+    ids.OperationID.SERVO.value.POSITION,
+)
+servo_oxidizer_intake_frame = Frame(
+    ids.BoardID.SOFTWARE,
+    ids.PriorityID.LOW,
+    ids.ActionID.FEED,
+    ids.BoardID.ROCKET,
+    ids.DeviceID.SERVO,
+    1,
+    ids.DataTypeID.INT16,
+    ids.OperationID.SERVO.value.POSITION,
+)
+servo_fuel_main_frame = Frame(
+    ids.BoardID.SOFTWARE,
+    ids.PriorityID.LOW,
+    ids.ActionID.FEED,
+    ids.BoardID.ROCKET,
+    ids.DeviceID.SERVO,
+    2,
+    ids.DataTypeID.INT16,
+    ids.OperationID.SERVO.value.POSITION,
+)
+servo_oxidizer_main_frame = Frame(
+    ids.BoardID.SOFTWARE,
+    ids.PriorityID.LOW,
+    ids.ActionID.FEED,
+    ids.BoardID.ROCKET,
+    ids.DeviceID.SERVO,
+    3,
+    ids.DataTypeID.INT16,
+    ids.OperationID.SERVO.value.POSITION,
+)
